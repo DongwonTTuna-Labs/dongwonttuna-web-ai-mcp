@@ -16,6 +16,8 @@ const articlePath = resolve(projectRoot, "tests/fixtures/article.html");
 
 let fixtureServer: Server;
 let fixtureOrigin: string;
+let searchServer: Server;
+let searchOrigin: string;
 
 beforeAll(async () => {
   const article = await readFile(articlePath);
@@ -27,55 +29,19 @@ beforeAll(async () => {
     }
 
     if (request.method === "POST" && request.url === "/responses") {
-      let requestBody = "";
-      request.setEncoding("utf8");
-      request.on("data", (chunk) => {
-        requestBody += chunk;
+      response.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
       });
-      request.on("end", () => {
-        let body: { tools?: unknown };
-        try {
-          body = JSON.parse(requestBody);
-        } catch {
-          response.writeHead(400, { "Content-Type": "text/plain" });
-          response.end("invalid request JSON");
-          return;
-        }
-
-        const isSearch =
-          JSON.stringify(body.tools) ===
-          JSON.stringify([{ type: "web_search" }]);
-        response.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-        });
-        response.end(
-          (isSearch
-            ? [
-                'data: {"type":"response.web_search_call.in_progress"}',
-                "",
-                'data: {"type":"response.output_text.delta","delta":"Mocked search answer."}',
-                "",
-                'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/first","title":"First source","start_index":0,"end_index":6}}',
-                "",
-                'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/second"}}',
-                "",
-                'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/first","title":"Duplicate source"}}',
-                "",
-                'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
-                "",
-                "",
-              ]
-            : [
-                'data: {"type":"response.output_text.delta","delta":"Mocked Codex summary."}',
-                "",
-                'data: {"type":"response.completed","response":{"status":"completed"}}',
-                "",
-                "",
-              ]
-          ).join("\n"),
-        );
-      });
+      response.end(
+        [
+          'data: {"type":"response.output_text.delta","delta":"Mocked Codex summary."}',
+          "",
+          'data: {"type":"response.completed","response":{"status":"completed"}}',
+          "",
+          "",
+        ].join("\n"),
+      );
       return;
     }
 
@@ -97,9 +63,61 @@ beforeAll(async () => {
   fixtureOrigin = `http://127.0.0.1:${address.port}`;
 });
 
+beforeAll(async () => {
+  searchServer = createServer((request, response) => {
+    if (request.method === "POST" && request.url === "/responses") {
+      request.resume();
+      response.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+      });
+      response.end(
+        [
+          'data: {"type":"response.web_search_call.in_progress"}',
+          "",
+          'data: {"type":"response.output_text.delta","delta":"Mocked search answer."}',
+          "",
+          'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/first","title":"First source","start_index":0,"end_index":6}}',
+          "",
+          'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/second"}}',
+          "",
+          'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/first","title":"Duplicate source"}}',
+          "",
+          'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
+          "",
+          "",
+        ].join("\n"),
+      );
+      return;
+    }
+
+    response.writeHead(404, { "Content-Type": "text/plain" });
+    response.end("not found");
+  });
+
+  await new Promise<void>((resolveListen, reject) => {
+    searchServer.once("error", reject);
+    searchServer.listen(0, "127.0.0.1", () => {
+      searchServer.off("error", reject);
+      resolveListen();
+    });
+  });
+  const address = searchServer.address();
+  if (!address || typeof address === "string") {
+    throw new Error("search fixture server did not expose a TCP address");
+  }
+  searchOrigin = `http://127.0.0.1:${address.port}`;
+});
+
 afterAll(async () => {
   await new Promise<void>((resolveClose, reject) => {
     fixtureServer.close((error) => (error ? reject(error) : resolveClose()));
+  });
+});
+
+afterAll(async () => {
+  await new Promise<void>((resolveClose, reject) => {
+    searchServer.close((error) => (error ? reject(error) : resolveClose()));
   });
 });
 
@@ -114,6 +132,13 @@ function childEnvironment(): Record<string, string> {
     WEBAI_FETCH_TIMEOUT_MS: "2000",
     WEBAI_MAX_CONTENT_BYTES: "1048576",
     WEBAI_ALLOW_PRIVATE_NETWORKS: "true",
+  };
+}
+
+function searchChildEnvironment(): Record<string, string> {
+  return {
+    ...childEnvironment(),
+    CODEX_BASE_URL: searchOrigin,
   };
 }
 
@@ -170,29 +195,6 @@ describe("stdio MCP server", () => {
       expect(tool?.outputSchema).toMatchObject({
         type: "object",
         properties: { content: expect.any(Object) },
-      });
-
-      const searchTool = listed.tools.find(
-        (candidate) => candidate.name === "webai_search_web",
-      );
-      expect(searchTool?.inputSchema).toMatchObject({
-        type: "object",
-        required: expect.arrayContaining(["query"]),
-        additionalProperties: false,
-        properties: { query: expect.any(Object) },
-      });
-      expect(searchTool?.outputSchema).toMatchObject({
-        type: "object",
-        properties: {
-          answer: expect.any(Object),
-          sources: expect.any(Object),
-        },
-      });
-      expect(searchTool?.annotations).toMatchObject({
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: true,
       });
 
       const direct = await client.callTool({
@@ -264,6 +266,49 @@ describe("stdio MCP server", () => {
       expect(textFromResult(invalidCombination)).toMatch(
         /MCP error -32602: Input validation error/,
       );
+      await expect
+        .poll(() => stderr, { timeout: 2_000 })
+        .toContain("dongwonttuna-web-ai-mcp 0.1.0 started on stdio");
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("advertises a strict search schema and returns search citations", async () => {
+    const client = new Client({ name: "search-client", version: "0.1.0" });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [serverPath],
+      cwd: projectRoot,
+      env: searchChildEnvironment(),
+      stderr: "pipe",
+    });
+
+    try {
+      await client.connect(transport);
+      const listed = await client.listTools();
+      const searchTool = listed.tools.find(
+        (candidate) => candidate.name === "webai_search_web",
+      );
+      expect(searchTool?.inputSchema).toMatchObject({
+        type: "object",
+        required: expect.arrayContaining(["query"]),
+        additionalProperties: false,
+        properties: { query: expect.any(Object) },
+      });
+      expect(searchTool?.outputSchema).toMatchObject({
+        type: "object",
+        properties: {
+          answer: expect.any(Object),
+          sources: expect.any(Object),
+        },
+      });
+      expect(searchTool?.annotations).toMatchObject({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      });
 
       const searched = await client.callTool({
         name: "webai_search_web",
@@ -289,9 +334,6 @@ describe("stdio MCP server", () => {
         truncated: true,
         model_used: "gpt-5.6",
       });
-      await expect
-        .poll(() => stderr, { timeout: 2_000 })
-        .toContain("dongwonttuna-web-ai-mcp 0.1.0 started on stdio");
     } finally {
       await client.close();
     }
