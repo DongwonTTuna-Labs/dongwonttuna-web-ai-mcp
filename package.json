@@ -1,0 +1,39 @@
+{
+  "name": "dongwonttuna-web-ai-mcp",
+  "version": "0.1.0",
+  "description": "A Reader-like MCP server powered exclusively by Codex models.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "dongwonttuna-web-ai-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "biome ci .",
+    "test": "npm run build && vitest run",
+    "smoke:live": "node scripts/smoke-live.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@mozilla/readability": "^0.6.0",
+    "linkedom": "^0.18.13",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2",
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.8",
+    "@types/node": "^26.2.0",
+    "@types/turndown": "^5.0.6",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
