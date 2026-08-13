@@ -27,19 +27,55 @@ beforeAll(async () => {
     }
 
     if (request.method === "POST" && request.url === "/responses") {
-      response.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
+      let requestBody = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk) => {
+        requestBody += chunk;
       });
-      response.end(
-        [
-          'data: {"type":"response.output_text.delta","delta":"Mocked Codex summary."}',
-          "",
-          'data: {"type":"response.completed","response":{"status":"completed"}}',
-          "",
-          "",
-        ].join("\n"),
-      );
+      request.on("end", () => {
+        let body: { tools?: unknown };
+        try {
+          body = JSON.parse(requestBody);
+        } catch {
+          response.writeHead(400, { "Content-Type": "text/plain" });
+          response.end("invalid request JSON");
+          return;
+        }
+
+        const isSearch =
+          JSON.stringify(body.tools) ===
+          JSON.stringify([{ type: "web_search" }]);
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+        });
+        response.end(
+          (isSearch
+            ? [
+                'data: {"type":"response.web_search_call.in_progress"}',
+                "",
+                'data: {"type":"response.output_text.delta","delta":"Mocked search answer."}',
+                "",
+                'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/first","title":"First source","start_index":0,"end_index":6}}',
+                "",
+                'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/second"}}',
+                "",
+                'data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test/first","title":"Duplicate source"}}',
+                "",
+                'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
+                "",
+                "",
+              ]
+            : [
+                'data: {"type":"response.output_text.delta","delta":"Mocked Codex summary."}',
+                "",
+                'data: {"type":"response.completed","response":{"status":"completed"}}',
+                "",
+                "",
+              ]
+          ).join("\n"),
+        );
+      });
       return;
     }
 
@@ -120,8 +156,10 @@ describe("stdio MCP server", () => {
       });
 
       const listed = await client.listTools();
-      expect(listed.tools).toHaveLength(1);
-      const tool = listed.tools[0];
+      expect(listed.tools).toHaveLength(2);
+      const tool = listed.tools.find(
+        (candidate) => candidate.name === "webai_read_url",
+      );
       expect(tool?.name).toBe("webai_read_url");
       expect(tool?.inputSchema).toMatchObject({
         type: "object",
@@ -132,6 +170,29 @@ describe("stdio MCP server", () => {
       expect(tool?.outputSchema).toMatchObject({
         type: "object",
         properties: { content: expect.any(Object) },
+      });
+
+      const searchTool = listed.tools.find(
+        (candidate) => candidate.name === "webai_search_web",
+      );
+      expect(searchTool?.inputSchema).toMatchObject({
+        type: "object",
+        required: expect.arrayContaining(["query"]),
+        additionalProperties: false,
+        properties: { query: expect.any(Object) },
+      });
+      expect(searchTool?.outputSchema).toMatchObject({
+        type: "object",
+        properties: {
+          answer: expect.any(Object),
+          sources: expect.any(Object),
+        },
+      });
+      expect(searchTool?.annotations).toMatchObject({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
       });
 
       const direct = await client.callTool({
@@ -203,6 +264,31 @@ describe("stdio MCP server", () => {
       expect(textFromResult(invalidCombination)).toMatch(
         /MCP error -32602: Input validation error/,
       );
+
+      const searched = await client.callTool({
+        name: "webai_search_web",
+        arguments: {
+          query: "Find a mocked answer.",
+          response_format: "json",
+          max_length: 13,
+        },
+      });
+      expect(searched.isError).not.toBe(true);
+      const searchEnvelope = JSON.parse(textFromResult(searched));
+      expect(searchEnvelope).toEqual(searched.structuredContent);
+      expect(searchEnvelope).toEqual({
+        query: "Find a mocked answer.",
+        answer: "Mocked search",
+        sources: [
+          {
+            url: "https://example.test/first",
+            title: "First source",
+          },
+          { url: "https://example.test/second" },
+        ],
+        truncated: true,
+        model_used: "gpt-5.6",
+      });
       await expect
         .poll(() => stderr, { timeout: 2_000 })
         .toContain("dongwonttuna-web-ai-mcp 0.1.0 started on stdio");

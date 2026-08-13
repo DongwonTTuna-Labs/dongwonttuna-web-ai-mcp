@@ -18,29 +18,44 @@ await access(serverPath).catch(() => {
   process.exit(1);
 });
 
+const smokeMode = process.env.WEBAI_SMOKE_MODE ?? "reader";
+if (smokeMode !== "reader" && smokeMode !== "search") {
+  console.error("WEBAI_SMOKE_MODE must be reader or search.");
+  process.exit(1);
+}
+
 const smokeUrl = process.env.WEBAI_SMOKE_URL ?? "https://example.com/";
 const smokeInstruction =
   process.env.WEBAI_SMOKE_INSTRUCTION ??
   "Summarize the page's main purpose in one short sentence.";
-if (!smokeInstruction.trim() || smokeInstruction.length > 2000) {
-  console.error(
-    "WEBAI_SMOKE_INSTRUCTION must contain between 1 and 2000 characters.",
-  );
-  process.exit(1);
-}
+const smokeQuery =
+  process.env.WEBAI_SMOKE_QUERY ??
+  "What is the purpose of the Example Domain website?";
 
-let parsedSmokeUrl;
-try {
-  parsedSmokeUrl = new URL(smokeUrl);
-} catch {
-  console.error("WEBAI_SMOKE_URL must be a valid URL.");
-  process.exit(1);
-}
-if (
-  parsedSmokeUrl.protocol !== "http:" &&
-  parsedSmokeUrl.protocol !== "https:"
-) {
-  console.error("WEBAI_SMOKE_URL must use http or https.");
+if (smokeMode === "reader") {
+  if (!smokeInstruction.trim() || smokeInstruction.length > 2000) {
+    console.error(
+      "WEBAI_SMOKE_INSTRUCTION must contain between 1 and 2000 characters.",
+    );
+    process.exit(1);
+  }
+
+  let parsedSmokeUrl;
+  try {
+    parsedSmokeUrl = new URL(smokeUrl);
+  } catch {
+    console.error("WEBAI_SMOKE_URL must be a valid URL.");
+    process.exit(1);
+  }
+  if (
+    parsedSmokeUrl.protocol !== "http:" &&
+    parsedSmokeUrl.protocol !== "https:"
+  ) {
+    console.error("WEBAI_SMOKE_URL must use http or https.");
+    process.exit(1);
+  }
+} else if (!smokeQuery.trim() || smokeQuery.length > 500) {
+  console.error("WEBAI_SMOKE_QUERY must contain between 1 and 500 characters.");
   process.exit(1);
 }
 
@@ -86,45 +101,71 @@ transport.stderr?.on("data", (chunk) => {
 try {
   await client.connect(transport);
   const listed = await client.listTools();
-  if (!listed.tools.some((tool) => tool.name === "webai_read_url")) {
-    throw new Error("The server did not advertise webai_read_url");
+  const toolName =
+    smokeMode === "search" ? "webai_search_web" : "webai_read_url";
+  if (!listed.tools.some((tool) => tool.name === toolName)) {
+    throw new Error(`The server did not advertise ${toolName}`);
   }
 
   const result = await client.callTool({
-    name: "webai_read_url",
-    arguments: {
-      url: smokeUrl,
-      instruction: smokeInstruction,
-      response_format: "markdown",
-      max_length: 2000,
-    },
+    name: toolName,
+    arguments:
+      smokeMode === "search"
+        ? {
+            query: smokeQuery,
+            response_format: "markdown",
+            max_length: 2000,
+          }
+        : {
+            url: smokeUrl,
+            instruction: smokeInstruction,
+            response_format: "markdown",
+            max_length: 2000,
+          },
   });
 
   const text = result.content.find((item) => item.type === "text")?.text;
   if (result.isError) {
-    throw new Error(
-      text || "webai_read_url returned an unspecified tool error",
-    );
+    throw new Error(text || `${toolName} returned an unspecified tool error`);
   }
   if (!text?.trim()) {
-    throw new Error("webai_read_url returned no text content");
+    throw new Error(`${toolName} returned no text content`);
   }
 
   const structured = result.structuredContent;
   if (!structured || typeof structured !== "object") {
-    throw new Error("webai_read_url returned no structuredContent");
+    throw new Error(`${toolName} returned no structuredContent`);
   }
   if (typeof structured.model_used !== "string" || !structured.model_used) {
-    throw new Error("The instruction-backed call did not report model_used");
+    throw new Error(`${toolName} did not report model_used`);
   }
 
-  const summary = {
-    ok: true,
-    url: structured.url,
-    final_url: structured.final_url,
-    model_used: structured.model_used,
-    content_preview: sanitizeResultText(text.slice(0, 500)),
-  };
+  let summary;
+  if (smokeMode === "search") {
+    if (typeof structured.answer !== "string") {
+      throw new Error("webai_search_web returned no structured answer");
+    }
+    if (!Array.isArray(structured.sources)) {
+      throw new Error("webai_search_web returned no structured source list");
+    }
+    summary = {
+      ok: true,
+      mode: smokeMode,
+      query: structured.query,
+      model_used: structured.model_used,
+      source_count: structured.sources.length,
+      answer_preview: sanitizeResultText(structured.answer.slice(0, 500)),
+    };
+  } else {
+    summary = {
+      ok: true,
+      mode: smokeMode,
+      url: structured.url,
+      final_url: structured.final_url,
+      model_used: structured.model_used,
+      content_preview: sanitizeResultText(text.slice(0, 500)),
+    };
+  }
   console.log(redact(JSON.stringify(summary, null, 2)));
 } catch (error) {
   const detail = error instanceof Error ? error.stack || error.message : error;

@@ -1,8 +1,8 @@
 # dongwonttuna-web-ai-mcp
 
-`dongwonttuna-web-ai-mcp` is a jina Reader-like MCP server that turns a web
-page into LLM-friendly content. It can return the extracted page directly or
-apply an instruction with a Codex model.
+`dongwonttuna-web-ai-mcp` is a jina Reader- and Search-like MCP server. It can
+turn a web page into LLM-friendly content, apply a Codex instruction to that
+content, or search the web for an evidence-based answer with source URLs.
 
 The AI backend is deliberately one Codex tuple: one API key, one model, and one
 base URL. The base URL must expose an OpenAI Responses API-compatible
@@ -121,6 +121,40 @@ the structured result; the JSON envelope itself is never truncated. Fetch,
 extraction, policy, and Codex failures are returned as MCP tool errors with an
 actionable message.
 
+### `webai_search_web`
+
+Uses the configured Codex Responses endpoint with its built-in `web_search`
+tool to answer a query and return the URL citations emitted by the model.
+
+#### Input
+
+| Field | Required | Default | Description |
+| --- | --- | --- | --- |
+| `query` | Yes | None | Search query from 1 through 500 characters. |
+| `response_format` | No | `markdown` | `markdown` or `json`. |
+| `max_length` | No | `20000` | Maximum answer length, from 1 through 50000 characters. It does not limit the source list or JSON envelope. |
+
+The request exposes only the Responses API `web_search` tool and does not force
+`tool_choice`; the model may answer without invoking search.
+
+#### Output
+
+The result contains one text content block and matching `structuredContent`.
+Its declared `outputSchema` has the following fields:
+
+| Field | Description |
+| --- | --- |
+| `query` | Original search query. |
+| `answer` | Model answer, limited by `max_length`. |
+| `sources` | Ordered, URL-deduplicated citations with `url` and an optional `title`. This may be an empty array when the model does not search. |
+| `truncated` | Whether the answer was truncated. Sources do not affect this value. |
+| `model_used` | Configured Codex model used for the search. |
+
+For `response_format: "markdown"`, the text block contains the answer followed
+by a `## Sources` numbered list. For `response_format: "json"`, it is a JSON
+serialization of the structured result. Only `answer` is limited by
+`max_length`; the source section and JSON envelope are never truncated.
+
 ## Security
 
 The fetcher resolves every hostname before connecting and requires every A and
@@ -143,9 +177,10 @@ An address can therefore change between validation and connection. Do not
 expose the server to untrusted callers in an environment where this residual
 risk is unacceptable.
 
-API keys and Authorization headers are not included in normal output or error
-messages. Keep credentials in the MCP client's environment rather than source
-files.
+The configured API key is exact-match redacted from successful model text and
+source URL/title fields. Error messages additionally redact Authorization
+credential values. Keep credentials in the MCP client's environment rather
+than source files.
 
 ## Manual live smoke test
 
@@ -160,15 +195,24 @@ CODEX_BASE_URL=https://api.openai.com/v1 \
 npm run smoke:live
 ```
 
-`WEBAI_SMOKE_URL` and `WEBAI_SMOKE_INSTRUCTION` optionally override the default
-page (`https://example.com/`) and instruction. The script starts the built
-stdio server through the MCP SDK, performs an instruction-backed tool call, and
-prints a redacted result summary; it never prints the API key.
+The default mode is `reader`. `WEBAI_SMOKE_URL` and
+`WEBAI_SMOKE_INSTRUCTION` optionally override its default page
+(`https://example.com/`) and instruction.
 
-## Roadmap
+To exercise the search tool instead, select `search` mode and optionally set a
+1-500 character query:
 
-- Unit 2: `webai_search_web`, using the Responses API web search tool after
-  compatibility is validated.
+```sh
+CODEX_API_KEY=your-api-key \
+CODEX_BASE_URL=https://api.openai.com/v1 \
+WEBAI_SMOKE_MODE=search \
+WEBAI_SMOKE_QUERY="What is the purpose of the Example Domain website?" \
+npm run smoke:live
+```
+
+The script starts the built stdio server through the MCP SDK, performs the
+selected live tool call, and prints a redacted result summary; it never prints
+the API key. The live smoke test is not part of CI or `npm test`.
 
 ## License
 
