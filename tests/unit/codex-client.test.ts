@@ -182,6 +182,150 @@ describe("CodexClient", () => {
     }
   });
 
+  it("sends only web_search and aggregates SSE and JSON citations identically", async () => {
+    const requests: CapturedRequest[] = [];
+    const firstUrl = "https://example.test/first?token=unit-test-secret";
+    const secondUrl = "https://example.test/second";
+    let callCount = 0;
+
+    await withServer(
+      async (request, response) => {
+        requests.push(await readRequest(request));
+        callCount += 1;
+
+        if (callCount === 1) {
+          response.writeHead(200, { "Content-Type": "text/event-stream" });
+          response.end(
+            [
+              'data: {"type":"response.output_text.delta","delta":"same unit-test-secret search output"}',
+              "",
+              'data: {"type":"response.web_search_call.searching","error":{"message":"not a response failure"}}',
+              "",
+              `data: ${JSON.stringify({
+                type: "response.output_text.annotation.added",
+                annotation: {
+                  type: "url_citation",
+                  url: firstUrl,
+                  title: "Secret unit-test-secret source",
+                  start_index: 0,
+                  end_index: 4,
+                },
+              })}`,
+              "",
+              `data: ${JSON.stringify({
+                type: "response.output_text.annotation.added",
+                annotation: {
+                  type: "url_citation",
+                  url: secondUrl,
+                  title: "Bearer some-example-token",
+                },
+              })}`,
+              "",
+              `data: ${JSON.stringify({
+                type: "response.output_text.annotation.added",
+                annotation: {
+                  type: "url_citation",
+                  url: firstUrl,
+                  title: "duplicate must not win",
+                },
+              })}`,
+              "",
+              'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
+              "",
+              "",
+            ].join("\n"),
+          );
+          return;
+        }
+
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(
+          JSON.stringify({
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                content: [
+                  {
+                    type: "output_text",
+                    text: "same unit-test-secret search output",
+                    annotations: [
+                      {
+                        type: "url_citation",
+                        url: firstUrl,
+                        title: "Secret unit-test-secret source",
+                        start_index: 0,
+                        end_index: 4,
+                      },
+                      { type: "not_a_citation", url: "https://wrong.test" },
+                      {
+                        type: "url_citation",
+                        url: secondUrl,
+                        title: "Bearer some-example-token",
+                      },
+                      {
+                        type: "url_citation",
+                        url: firstUrl,
+                        title: "duplicate must not win",
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      },
+      async (baseUrl) => {
+        const codex = client(baseUrl);
+        const sseResult = await codex.search(
+          "search instructions",
+          "search query",
+        );
+        const jsonResult = await codex.search(
+          "search instructions",
+          "search query",
+        );
+
+        expect(sseResult).toEqual({
+          text: "same [REDACTED] search output",
+          citations: [
+            {
+              url: "https://example.test/first?token=[REDACTED]",
+              title: "Secret [REDACTED] source",
+            },
+            { url: secondUrl, title: "Bearer some-example-token" },
+          ],
+        });
+        expect(jsonResult).toEqual(sseResult);
+      },
+    );
+
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(request).toMatchObject({
+        method: "POST",
+        url: "/responses",
+        authorization: "Bearer unit-test-secret",
+        contentType: "application/json",
+      });
+      expect(JSON.parse(request.body)).toEqual({
+        model: "gpt-5.6",
+        instructions: "search instructions",
+        input: [
+          {
+            role: "user",
+            content: [{ type: "input_text", text: "search query" }],
+          },
+        ],
+        stream: true,
+        store: false,
+        reasoning: { effort: "high" },
+        tools: [{ type: "web_search" }],
+      });
+    }
+  });
+
   it("uses top-level output_text only after standard output has no text", async () => {
     await withServer(
       (_request, response) => {

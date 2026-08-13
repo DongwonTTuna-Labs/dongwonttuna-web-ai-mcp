@@ -9,6 +9,16 @@ export interface CodexClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+export interface CodexCitation {
+  url: string;
+  title?: string;
+}
+
+export interface CodexSearchResult {
+  text: string;
+  citations: CodexCitation[];
+}
+
 export class CodexRefusalError extends Error {
   readonly refusal: string;
 
@@ -27,6 +37,8 @@ interface SseEvent {
 interface SseState {
   outputText: string;
   refusalText: string;
+  citations: CodexCitation[];
+  seenCitationUrls: Set<string>;
 }
 
 const ERROR_BODY_SUMMARY_LIMIT = 500;
@@ -53,6 +65,21 @@ export class CodexClient {
   }
 
   async process(instructions: string, input: string): Promise<string> {
+    return (await this.request(instructions, input, false)).text;
+  }
+
+  async search(
+    instructions: string,
+    input: string,
+  ): Promise<CodexSearchResult> {
+    return this.request(instructions, input, true);
+  }
+
+  private async request(
+    instructions: string,
+    input: string,
+    webSearch: boolean,
+  ): Promise<CodexSearchResult> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
@@ -63,19 +90,15 @@ export class CodexClient {
           Authorization: `Bearer ${this.apiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          model: this.model,
-          instructions,
-          input: [
-            {
-              role: "user",
-              content: [{ type: "input_text", text: input }],
-            },
-          ],
-          stream: true,
-          store: false,
-          reasoning: { effort: this.reasoningEffort },
-        }),
+        body: JSON.stringify(
+          buildRequestBody(
+            this.model,
+            this.reasoningEffort,
+            instructions,
+            input,
+            webSearch,
+          ),
+        ),
         signal: controller.signal,
       });
 
@@ -88,7 +111,7 @@ export class CodexClient {
       const output = contentType.includes("text/event-stream")
         ? await parseSseResponse(response)
         : await parseJsonResponse(response);
-      return redactApiKey(output, this.apiKey);
+      return redactSuccessfulResult(output, this.apiKey);
     } catch (error) {
       if (controller.signal.aborted) {
         throw new Error(`Codex request timed out after ${this.timeoutMs}ms`);
@@ -122,14 +145,42 @@ export class CodexClient {
   }
 }
 
-async function parseSseResponse(response: Response): Promise<string> {
+function buildRequestBody(
+  model: string,
+  reasoningEffort: CodexReasoningEffort,
+  instructions: string,
+  input: string,
+  webSearch: boolean,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model,
+    instructions,
+    input: [
+      {
+        role: "user",
+        content: [{ type: "input_text", text: input }],
+      },
+    ],
+    stream: true,
+    store: false,
+    reasoning: { effort: reasoningEffort },
+  };
+  if (webSearch) {
+    body.tools = [{ type: "web_search" }];
+  }
+  return body;
+}
+
+async function parseSseResponse(
+  response: Response,
+): Promise<CodexSearchResult> {
   if (!response.body) {
     throw new Error("Codex SSE response had no body");
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const state: SseState = { outputText: "", refusalText: "" };
+  const state = createSseState();
   let buffer = "";
 
   while (true) {
@@ -143,7 +194,11 @@ async function parseSseResponse(response: Response): Promise<string> {
       const event = parseSseEvent(block);
       if (event && consumeSseEvent(event, state)) {
         await reader.cancel();
-        return finishResponse(state.outputText, state.refusalText);
+        return finishResponse(
+          state.outputText,
+          state.refusalText,
+          state.citations,
+        );
       }
       boundary = findSseBoundary(buffer);
     }
@@ -151,11 +206,24 @@ async function parseSseResponse(response: Response): Promise<string> {
     if (done) {
       const event = parseSseEvent(buffer);
       if (event && consumeSseEvent(event, state)) {
-        return finishResponse(state.outputText, state.refusalText);
+        return finishResponse(
+          state.outputText,
+          state.refusalText,
+          state.citations,
+        );
       }
       throw new Error("Codex SSE stream ended before response.completed");
     }
   }
+}
+
+function createSseState(): SseState {
+  return {
+    outputText: "",
+    refusalText: "",
+    citations: [],
+    seenCitationUrls: new Set(),
+  };
 }
 
 function findSseBoundary(
@@ -217,11 +285,14 @@ function consumeSseEvent(event: SseEvent, state: SseState): boolean {
     }
     throw new Error("Codex SSE response contained an invalid event payload");
   }
+  const type = typeof payload.type === "string" ? payload.type : event.event;
+  if (type?.startsWith("response.web_search_call.")) {
+    return false;
+  }
   if (payload.error != null) {
     throw new Error(`Codex response error: ${describeError(payload.error)}`);
   }
 
-  const type = typeof payload.type === "string" ? payload.type : event.event;
   switch (type) {
     case "response.output_text.delta": {
       if (typeof payload.delta !== "string") {
@@ -230,6 +301,9 @@ function consumeSseEvent(event: SseEvent, state: SseState): boolean {
       state.outputText += payload.delta;
       return false;
     }
+    case "response.output_text.annotation.added":
+      addCitation(state, payload.annotation);
+      return false;
     case "response.refusal.delta": {
       if (typeof payload.delta !== "string") {
         throw new Error("Codex refusal delta did not contain text");
@@ -263,6 +337,7 @@ function consumeSseEvent(event: SseEvent, state: SseState): boolean {
 function isHandledSseType(type: string): boolean {
   return (
     type === "response.output_text.delta" ||
+    type === "response.output_text.annotation.added" ||
     type === "response.refusal.delta" ||
     type === "response.refusal.done" ||
     type === "response.completed" ||
@@ -272,7 +347,9 @@ function isHandledSseType(type: string): boolean {
   );
 }
 
-async function parseJsonResponse(response: Response): Promise<string> {
+async function parseJsonResponse(
+  response: Response,
+): Promise<CodexSearchResult> {
   let payload: unknown;
   try {
     payload = await response.json();
@@ -303,6 +380,7 @@ async function parseJsonResponse(response: Response): Promise<string> {
 
   const outputText: string[] = [];
   const refusalText: string[] = [];
+  const state = createSseState();
   if (Array.isArray(payload.output)) {
     for (const item of payload.output) {
       if (
@@ -315,6 +393,11 @@ async function parseJsonResponse(response: Response): Promise<string> {
       for (const part of item.content) {
         if (!isRecord(part)) {
           continue;
+        }
+        if (Array.isArray(part.annotations)) {
+          for (const annotation of part.annotations) {
+            addCitation(state, annotation);
+          }
         }
         if (part.type === "output_text" && typeof part.text === "string") {
           outputText.push(part.text);
@@ -331,17 +414,44 @@ async function parseJsonResponse(response: Response): Promise<string> {
   const standardOutput = outputText.join("");
   const fallbackOutput =
     typeof payload.output_text === "string" ? payload.output_text : "";
-  return finishResponse(standardOutput || fallbackOutput, refusalText.join(""));
+  return finishResponse(
+    standardOutput || fallbackOutput,
+    refusalText.join(""),
+    state.citations,
+  );
 }
 
-function finishResponse(outputText: string, refusalText: string): string {
+function finishResponse(
+  outputText: string,
+  refusalText: string,
+  citations: CodexCitation[],
+): CodexSearchResult {
   if (outputText.length > 0) {
-    return outputText;
+    return { text: outputText, citations };
   }
   if (refusalText.length > 0) {
     throw new CodexRefusalError(refusalText);
   }
   throw new Error("Codex response completed without output text");
+}
+
+function addCitation(state: SseState, annotation: unknown): void {
+  if (
+    !isRecord(annotation) ||
+    annotation.type !== "url_citation" ||
+    typeof annotation.url !== "string" ||
+    annotation.url.length === 0 ||
+    state.seenCitationUrls.has(annotation.url)
+  ) {
+    return;
+  }
+
+  state.seenCitationUrls.add(annotation.url);
+  const citation: CodexCitation = { url: annotation.url };
+  if (typeof annotation.title === "string") {
+    citation.title = annotation.title;
+  }
+  state.citations.push(citation);
 }
 
 function mergeCompletedRefusal(
@@ -435,6 +545,24 @@ function redactSensitive(value: string, apiKey: string): string {
       "$1[REDACTED]",
     )
     .replace(/\bbearer\s+[^\s"',;}]+/gi, "Bearer [REDACTED]");
+}
+
+function redactSuccessfulResult(
+  result: CodexSearchResult,
+  apiKey: string,
+): CodexSearchResult {
+  return {
+    text: redactApiKey(result.text, apiKey),
+    citations: result.citations.map((citation) => {
+      const redacted: CodexCitation = {
+        url: redactApiKey(citation.url, apiKey),
+      };
+      if (citation.title !== undefined) {
+        redacted.title = redactApiKey(citation.title, apiKey);
+      }
+      return redacted;
+    }),
+  };
 }
 
 function redactApiKey(value: string, apiKey: string): string {
