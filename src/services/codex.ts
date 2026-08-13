@@ -85,10 +85,10 @@ export class CodexClient {
 
       const contentType =
         response.headers.get("content-type")?.toLowerCase() ?? "";
-      if (contentType.includes("text/event-stream")) {
-        return await parseSseResponse(response);
-      }
-      return await parseJsonResponse(response);
+      const output = contentType.includes("text/event-stream")
+        ? await parseSseResponse(response)
+        : await parseJsonResponse(response);
+      return redactApiKey(output, this.apiKey);
     } catch (error) {
       if (controller.signal.aborted) {
         throw new Error(`Codex request timed out after ${this.timeoutMs}ms`);
@@ -421,11 +421,7 @@ function redactAuthorizationFields(value: unknown): unknown {
 }
 
 function redactSensitive(value: string, apiKey: string): string {
-  let redacted = value;
-  if (apiKey.length > 0) {
-    redacted = redacted.split(apiKey).join("[REDACTED]");
-  }
-  return redacted
+  return redactApiKey(value, apiKey)
     .replace(
       /(["']?authorization["']?\s*[:=]\s*)(["'])(?:\\.|[^"'\\])*(["'])/gi,
       "$1$2[REDACTED]$3",
@@ -439,6 +435,10 @@ function redactSensitive(value: string, apiKey: string): string {
       "$1[REDACTED]",
     )
     .replace(/\bbearer\s+[^\s"',;}]+/gi, "Bearer [REDACTED]");
+}
+
+function redactApiKey(value: string, apiKey: string): string {
+  return apiKey.length > 0 ? value.split(apiKey).join("[REDACTED]") : value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

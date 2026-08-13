@@ -202,6 +202,83 @@ describe("CodexClient", () => {
     );
   });
 
+  it("redacts the API key reflected in a successful SSE output", async () => {
+    await withServer(
+      (_request, response) => {
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.end(
+          'data: {"type":"response.output_text.delta","delta":"reflected unit-test-secret value"}\n\n' +
+            'data: {"type":"response.completed"}\n\n',
+        );
+      },
+      async (baseUrl) => {
+        const result = await client(baseUrl).process("instructions", "input");
+
+        expect(result).toContain("[REDACTED]");
+        expect(result).not.toContain("unit-test-secret");
+      },
+    );
+  });
+
+  it("redacts the API key reflected in a successful raw JSON output", async () => {
+    await withServer(
+      (_request, response) => {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(
+          JSON.stringify({
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                content: [
+                  {
+                    type: "output_text",
+                    text: "reflected unit-test-secret value",
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      },
+      async (baseUrl) => {
+        const result = await client(baseUrl).process("instructions", "input");
+
+        expect(result).toContain("[REDACTED]");
+        expect(result).not.toContain("unit-test-secret");
+      },
+    );
+  });
+
+  it("preserves unrelated Bearer examples in successful output", async () => {
+    await withServer(
+      (_request, response) => {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(
+          JSON.stringify({
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                content: [
+                  {
+                    type: "output_text",
+                    text: "Authorization: Bearer some-example-token",
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      },
+      async (baseUrl) => {
+        await expect(
+          client(baseUrl).process("instructions", "input"),
+        ).resolves.toBe("Authorization: Bearer some-example-token");
+      },
+    );
+  });
+
   it("surfaces SSE and JSON refusal-only responses as CodexRefusalError", async () => {
     let callCount = 0;
     await withServer(
